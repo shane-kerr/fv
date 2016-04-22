@@ -1,0 +1,385 @@
+#! /usr/bin/env python3
+
+import argparse
+import hashlib
+import os
+import stat
+import sys
+import tarfile
+import time
+
+def hash_file(filename):
+    hash_fd = os.open(filename, os.O_NOATIME | os.O_RDONLY)
+    hash_fp = os.fdopen(hash_fd, 'rb')
+    file_hash = hashlib.sha224()
+    while True:
+        buf = hash_fp.read(65536)
+        if len(buf) == 0:
+            hash_fp.close()
+            return file_hash
+        file_hash.update(buf)
+
+def add_to_archive(archive, filename):
+    # It is inefficient for us to make the stat() call here, since the
+    # gettarinfo() method will also need a stat() call, but we have
+    # two motivations:
+    #
+    # 1. We want to skip sockets. We also could do this by looking for
+    #    a None object returned to gettarinfo(), and then only
+    #    invoking stat() afterwards to confirm that the failure is due
+    #    to it being a socket.
+    # 2. We want access to the full nanosecond-resolution timestamp.
+    #    This is available in stat(), but it seems like tarinfo() uses
+    #    the floating-point value (which has less resolution due to
+    #    the limits of the floating point format). Perhaps a better
+    #    long-term solution is to patch the tarinfo module so that it 
+    #    uses nanosecond-resolution when available.
+    #
+    # In any case, multiple stat() calls should be cached in the OS, and
+    # the cost should be dwarfed by reading file data to generate the
+    # hash of the files.
+    file_stat = os.lstat(filename)
+    if stat.S_ISSOCK(file_stat.st_mode):
+        print(sys.argv[0] + ":" + filename + ": socket ignored",
+              file=sys.stderr)
+        return False
+    # only generate the hash for regular files
+    if stat.S_ISREG(file_stat.st_mode):
+        file_hash = hash_file(filename)
+    else:
+        file_hash = None
+
+    info = archive.gettarinfo(name=filename)
+
+    # We don't want to actually store the file, just a hash.
+    # We'll set the file size to 0 in the archive, so we need to
+    # store the actual size somewhere. We'll do that in the "comment"
+    # header of the PAX file format. If we have a regular file, we
+    # will also store the hash of the file.
+    if file_hash:
+        info.pax_headers['comment'] = (str(info.size) + "," +
+                                       file_hash.hexdigest())
+    else:
+        info.pax_headers['comment'] = str(info.size)
+    info.size = 0
+
+    # We will manually dump the full high-resolution time in the PAX
+    # extension header.
+    s_atime = "%010d" % file_stat.st_atime_ns
+    info.pax_headers['atime'] = s_atime[:-9] + '.' + s_atime[-9:]
+    s_mtime = "%010d" % file_stat.st_mtime_ns
+    info.pax_headers['mtime'] = s_mtime[:-9] + '.' + s_mtime[-9:]
+
+    # After our file information is completed, go ahead and output it.
+    archive.addfile(info)
+
+    # VOODOO ALERT!
+    #
+    # Adding the file actually stores metadata in-memory. This is
+    # costly if we have a lot of files. Do an evil hack to free up
+    # that memory.
+    #
+    # Our archive won't act like a normal tarfile  object after this,
+    # it may not work with later versions of the library, and so on.
+    archive.members.pop()
+
+    # TODO: we may want to zero-out the archive.inodes dictionary too
+
+    return True
+
+# TODO: append mode
+# TODO: follow mode
+# NOTE: race conditions abound...
+def archive_create(output_filename, verbose, pathnames):
+    if output_filename in ("-", None):
+        binary_stdout = os.fdopen(sys.stdout.fileno(), "wb")
+        out_tar = tarfile.open(fileobj=binary_stdout, mode="w|",
+                               format=tarfile.PAX_FORMAT)
+    else:
+        out_tar = tarfile.open(name=output_filename, mode="w",
+                               format=tarfile.PAX_FORMAT)
+    for pathname in pathnames:
+        added = add_to_archive(out_tar, pathname)
+        if added and verbose:
+            print(pathname + "/", file=sys.stderr)
+        # XXX: sort walk somehow?
+        for root, dirs, names in os.walk(pathname):
+            # record our directory information (skipping the parent)
+            if root != pathname:
+                add_to_archive(out_tar, root)
+                if verbose:
+                    print(root + "/", file=sys.stderr)
+            # record each file in the directory
+            for name in sorted(names):
+                fullname = root + "/" + name
+                add_to_archive(out_tar, fullname)
+                if verbose:
+                    print(fullname, file=sys.stderr)
+    out_tar.close()
+
+def tar_type_to_filemode(info):
+    if info.isdir():
+        return 'd'
+    if info.issym():
+        return 'l'
+    if info.ischr():
+        return 'c'
+    if info.isblk():
+        return 'b'
+    if info.isfifo():
+        return 'p'
+    if info.isreg():
+        return '-'
+    # hmm... sockets are not supported in tar, apparently
+    return '?'
+
+def tar_filemode(info):
+    return tar_type_to_filemode(info) + stat.filemode(info.mode)[1:]
+
+def archive_list(input_filename, verbose, pathnames):
+    if input_filename in ("-", None):
+        binary_stdin = os.fdopen(sys.stdin.fileno(), "rb")
+        in_tar = tarfile.open(fileobj=binary_stdin, mode="r|",
+                              format=tarfile.PAX_FORMAT)
+    else:
+        in_tar = tarfile.open(name=input_filename, mode="r",
+                              format=tarfile.PAX_FORMAT)
+
+    remaining_pathnames = set(pathnames)
+    for info in in_tar:
+        name = info.name
+
+        # Occasionally we will get file names that cannot be encoded in
+        # Unicode. In this case, we will replace any unrecognized characters.
+        if 'hdrcharset' in info.pax_headers:
+            assert info.pax_headers['hdrcharset'] == 'BINARY'
+            name = name.encode('utf-8', 'replace').decode()
+
+        if pathnames:
+            if name in remaining_pathnames:
+                name_okay = True
+                remaining_pathnames.remove(name)
+            else:
+                name_okay = False
+        else:
+            name_okay = True
+        if info.isdir():
+            name = name + "/"
+            if name in remaining_pathnames:
+                name_okay = True
+                remaining_pathnames.remove(name)
+        if not name_okay:
+            continue
+
+        # if we have a device file then display the device information
+        # instead of the size
+        if info.ischr() or info.isblk():
+            dev = "%d,%d" % (info.devmajor, info.devminor)
+            size_str = "%7s " % dev
+        else:
+            size = int(info.pax_headers.get('comment', '0').split(',')[0])
+            size_str = "%7d " % size
+
+        if verbose:
+            if info.issym():
+                link_str = ' -> ' + info.linkname
+            else:
+                link_str = ''
+            # TODO: make the output identical to tar, which finds the longest
+            #       user name + group name in each directory and lists the
+            #       files in that directory using that width (or something
+            #       like that)
+            user_str = (info.uname + "/" + info.gname).ljust(11)
+            print(tar_filemode(info) + " " + 
+                  user_str + " " + size_str +
+                  time.strftime("%Y-%m-%d %H:%M ", 
+                                time.localtime(info.mtime)) +
+                  name + link_str)
+        else:
+            print(name)
+
+    if remaining_pathnames:
+        for pathname in sorted(remaining_pathnames):
+            print(sys.argv[0] + ": " + pathname + ": Not found in archive",
+                  file=sys.stderr)
+        print(sys.argv[0] + 
+              ": Exiting with failure status due to previous errors",
+              file = sys.stderr)
+        sys.exit(2)
+
+def archive_verify(verify_filename, verbose, pathnames):
+    if verify_filename in ("-", None):
+        binary_stdin = os.fdopen(sys.stdin.fileno(), "rb")
+        in_tar = tarfile.open(fileobj=binary_stdin, mode="r|",
+                              format=tarfile.PAX_FORMAT)
+    else:
+        in_tar = tarfile.open(name=verify_filename, mode="r",
+                              format=tarfile.PAX_FORMAT)
+
+    remaining_pathnames = set(pathnames)
+    for info in in_tar:
+        name = info.name
+        if pathnames:
+            if name in remaining_pathnames:
+                name_okay = True
+                remaining_pathnames.remove(name)
+            else:
+                name_okay = False
+        else:
+            name_okay = True
+        if info.isdir():
+            name = name + "/"
+            if name in remaining_pathnames:
+                name_okay = True
+                remaining_pathnames.remove(name)
+        if not name_okay:
+            continue
+
+        # output the file name if we are in verbose mode
+        if verbose:
+            print(name, file=sys.stderr)
+
+        # extract our recorded size, dates, and hash from commments
+        comment = info.pax_headers['comment']
+        if ',' in comment:
+            file_size_str, file_hash_hex = comment.split(',')
+        else:
+            file_size_str = comment
+            file_hash_hex = None
+        file_size = int(file_size_str)
+        atime_str = info.pax_headers['atime']
+        atime_list = atime_str.split('.')
+        atime_ns = (int(atime_list[0]) * 1000000000) + int(atime_list[1])
+        mtime_str = info.pax_headers['mtime']
+        mtime_list = mtime_str.split('.')
+        mtime_ns = (int(mtime_list[0]) * 1000000000) + int(mtime_list[1])
+
+        # get the actual file metadata
+        # XXX: should capture FileNotFound or whatever
+        meta = os.lstat(name)
+
+        # check what information we have
+        error_count = 0
+        if info.uid != meta.st_uid:
+            print(sys.argv[0] + ": " + name +
+                  (": uid is %d, expected %d" % (meta.st_uid, info.uid)),
+                  file=sys.stderr)
+            error_count = error_count + 1
+        if info.gid != meta.st_gid:
+            print(sys.argv[0] + ": " + name +
+                  (": gid is %d, expected %d" % (meta.st_gid, info.gid)),
+                  file=sys.stderr)
+            error_count = error_count + 1
+        if info.isreg() and (meta.st_size != file_size):
+            print(sys.argv[0] + ": " + name +
+                  (": size is %d, expected %d" % (meta.st_size, file_size)),
+                  file=sys.stderr)
+            error_count = error_count + 1
+        if atime_ns != meta.st_atime_ns:
+            meta_time_sec = meta.st_atime_ns // 1000000000
+            time_str = (time.strftime("%Y-%m-%d %H:%M:%S",
+                                      time.localtime(meta_time_sec)) + "." + 
+                        str(meta.st_atime_ns % 1000000000))
+            time_diff = (meta.st_atime_ns - atime_ns) / 1000000000
+            # TODO: improve error message
+            print(sys.argv[0] + ": " + name +
+                  (": atime is %s, %f second(s) after expected" % (time_str,
+                                                                 time_diff)),
+                  file=sys.stderr)
+            error_count = error_count + 1
+        if mtime_ns != meta.st_mtime_ns:
+            meta_time_sec = meta.st_mtime_ns // 1000000000
+            time_str = (time.strftime("%Y-%m-%d %H:%M:%S",
+                                      time.localtime(meta_time_sec)) + "." + 
+                        str(meta.st_mtime_ns % 1000000000))
+            time_diff = (meta.st_mtime_ns - mtime_ns) / 1000000000
+            # TODO: improve error message
+            print(sys.argv[0] + ": " + name +
+                  (": mtime is %s, %f second(s) after expected" % (time_str,
+                                                                 time_diff)),
+                  file=sys.stderr)
+            error_count = error_count + 1
+        stat_mode = stat.filemode(meta.st_mode)
+        tar_mode = tar_filemode(info)
+        if stat_mode != tar_mode:
+            print(sys.argv[0] + ": " + name +
+                  ": mode is " + stat_mode +
+                  ", expected " + tar_mode,
+                  file=sys.stderr)
+            error_count = error_count + 1
+
+        # if it's a symbolic link we need to check the target
+        if info.issym():
+            # XXX: should capture FileNotFound or whatever
+            file_target = os.readlink(name)
+            if file_target != info.linkname:
+                print(sys.argv[0] + ": " + name +
+                      ": link is " + file_target +
+                      ", expected " + info.linkname,
+                      file=sys.stderr)
+                error_count = error_count + 1
+
+        # if it's a device file we need to verify that the device
+        # is correct
+        if info.ischr() or info.isblk():
+            major = os.major(meta.st_rdev)
+            minor = os.minor(meta.st_rdev)
+            if (info.devminor != minor) or (info.devmajor != major):
+                print(sys.argv[0] + ": " + name +
+                      (": device is %s,%s, expected %s,%s" % (major, minor,
+                                                              info.devmajor,
+                                                              info.devminor)),
+                      file=sys.stderr)
+            
+        # if we have a hash, check it
+        if file_hash_hex is not None:
+            check_file_hash = hash_file(name)
+            check_file_hash_hex = check_file_hash.hexdigest()
+            if check_file_hash_hex != file_hash_hex:
+                print(sys.argv[0] + ": " + name +
+                      ": checksum mismatch",
+#                      ": checksum mismatch, got " + check_file_hash_hex +
+#                      ", expected " + file_hash_hex,
+                      file=sys.stderr)
+
+#    if remaining_pathnames:
+#        for pathname in sorted(remaining_pathnames):
+#            print(sys.argv[0] + ": " + pathname + ": Not found in archive",
+#                  file=sys.stderr)
+#        print(sys.argv[0] + 
+#              ": Exiting with failure status due to previous errors",
+#              file = sys.stderr)
+#        sys.exit(2)
+
+        # look for files that we don't find
+
+def main(args):
+    parser = argparse.ArgumentParser(
+        description='File verify - save and verify file data and metadata')
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument('-c', '--create', action='store_true',
+                       help="Create archive of file information")
+    group.add_argument('-t', '--list', action='store_true',
+                       help="List the contents of archive of file information")
+    group.add_argument('-x', '--verify', action='store_true',
+                       help="Check files using archive of file information")
+    parser.add_argument('-f', '--file',
+                        help='Use named archive file (default "-")')
+    parser.add_argument('-v', '--verbose', action='store_true',
+                        help='Be verbose when processing')
+    parser.add_argument('pathname', nargs='*', 
+                        help="files or directory names")
+    parsed_args = parser.parse_args(args=args)
+    if parsed_args.create:
+        archive_create(parsed_args.file, parsed_args.verbose,
+                       parsed_args.pathname)
+    if parsed_args.list:
+        archive_list(parsed_args.file, parsed_args.verbose,
+                     parsed_args.pathname)
+    if parsed_args.verify:
+        archive_verify(parsed_args.file, parsed_args.verbose,
+                       parsed_args.pathname)
+
+if __name__ == '__main__':
+    main(sys.argv[1:])
+
